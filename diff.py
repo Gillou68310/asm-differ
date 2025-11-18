@@ -1607,7 +1607,7 @@ class AsmProcessor:
     ) -> Tuple[str, str]:
         return mnemonic, args
 
-    def process_reloc(self, row: str, prev: str) -> Tuple[str, Optional[str]]:
+    def process_reloc(self, row: str, prev: str, next_line_num: int) -> Tuple[str, Optional[str]]:
         return prev, None
 
     def normalize(self, mnemonic: str, row: str) -> str:
@@ -1633,7 +1633,7 @@ class AsmProcessorMIPS(AsmProcessor):
         super().__init__(config)
         self.seen_jr_ra = False
 
-    def process_reloc(self, row: str, prev: str) -> Tuple[str, Optional[str]]:
+    def process_reloc(self, row: str, prev: str, next_line_num: int) -> Tuple[str, Optional[str]]:
         arch = self.config.arch
         if "R_MIPS_NONE" in row or "R_MIPS_JALR" in row:
             # GNU as emits no-op relocations immediately after real ones when
@@ -1736,7 +1736,7 @@ class AsmProcessorPPC(AsmProcessor):
 
         return mnemonic, args
 
-    def process_reloc(self, row: str, prev: str) -> Tuple[str, Optional[str]]:
+    def process_reloc(self, row: str, prev: str, next_line_num: int) -> Tuple[str, Optional[str]]:
         # row is the line with the relocations
         # prev is the line to apply relocations to
 
@@ -1892,7 +1892,7 @@ class AsmProcessorARM32(AsmProcessor):
                     return value + 1
         return 0
 
-    def process_reloc(self, row: str, prev: str) -> Tuple[str, Optional[str]]:
+    def process_reloc(self, row: str, prev: str, next_line_num: int) -> Tuple[str, Optional[str]]:
         arch = self.config.arch
         if "R_ARM_V4BX" in row:
             # R_ARM_V4BX converts "bx <reg>" to "mov pc,<reg>" for some targets.
@@ -2040,7 +2040,7 @@ class AsmProcessorX86(AsmProcessor):
 
         return mnemonic, args
 
-    def process_reloc(self, row: str, prev: str) -> Tuple[str, Optional[str]]:
+    def process_reloc(self, row: str, prev: str, next_line_num: int) -> Tuple[str, Optional[str]]:
         # ignore WRTSEG + FP 16-bit fixup
         ignore = [
             "WRTSEG",
@@ -2066,67 +2066,9 @@ class AsmProcessorX86(AsmProcessor):
         mnemonic, args = prev.split(maxsplit=1)
         offset = False
         addr_imm = None
-
-        # Calls
-
-        # Example lcall $0x0, $0x00
-        if "lcall" in mnemonic:
-            addr_imm = re.search(r".*", args)
-
-        # Example call a2f
-        # Example call *0
-        # Example jmp  64
-        elif mnemonic in X86_BRANCH_INSTRUCTIONS or "call" in mnemonic:
-            addr_imm = re.search(r"(^|(?<=\*)|(?<=\*\%cs\:))[0-9a-f]+(?!x)", args)
-
-        # Direct use of reloc
-        # Match 0x0 part to replace
-
-        # Example %edi,0
-        # Example movb $0x0,0x0
-        if not addr_imm:
-            addr_imm = re.search(r"(?:0x)?(?<![1-9])0$", args)
-
-        # Example movb $0x0,0x0(%si)
-        if not addr_imm:
-            addr_imm = re.search(r"(?<=,)(?:0x)?0+(?=\(.*\))", args)
-
-        # Example 0x0,0x8(%edi)
-        # Example 0x0,%edi
-        # Example *0x0(,%edx,4)
-        # Example $0x0,0x4(%edi)
-        if not addr_imm:
-            addr_imm = re.search(r"(^\$?|(?<=\*))(?:0x)?0(?!x)", args)
-
-        # Offset value
-
-        # Example movb $0x0,0x4
-        # Example %edi,4
-        if not addr_imm:
-            addr_imm = re.search(r"(?:-)?(?:0x)?[0-9a-f]+$", args)
-            offset = True
-
-        # Example movb $0x0,0x4(%si)
-        if not addr_imm:
-            addr_imm = re.search(r"(?<=,)(?:-)?(?:0x)?[0-9a-f]+", args)
-            offset = True
-
-        # Example 0x4,%eax
-        # Example $0x4,%eax
-        if not addr_imm:
-            addr_imm = re.search(r"(^|(?<=\*)|(?:\$))(?:-)?(?:0x)?[0-9a-f]+", args)
-            offset = True
-
-        if not addr_imm:
-            addr_imm = re.search(
-                r"(^|(?<=\*)|(?<=\%[fgdecs]s\:))(?:-)?(?:0x)?[0-9a-f]+", args
-            )
-            offset = True
-
-        if not addr_imm:
-            assert False, f"failed to find address immediate for line '{prev}'"
-
-        start, end = addr_imm.span()
+        last_op = False
+        line_num_str = row.split(":")[0]
+        line_num = int(line_num_str, 16) if line_num_str else None
 
         if "R_386_NONE" in row:
             pass
@@ -2148,9 +2090,9 @@ class AsmProcessorX86(AsmProcessor):
         elif "DISP32" in row:
             pass
         elif "OFF16" in row:
-            pass
+            last_op = next_line_num - 2 == line_num
         elif "OFF32" in row:
-            pass
+            last_op = next_line_num - 4 == line_num
         elif "OFFPC16" in row:
             if "+" in repl:
                 repl = repl.split("+")[0]
@@ -2176,6 +2118,67 @@ class AsmProcessorX86(AsmProcessor):
             pass
         else:
             assert False, f"unknown relocation type '{row}' for line '{prev}'"
+
+        # Calls
+
+        # Example lcall $0x0, $0x00
+        if "lcall" in mnemonic:
+            addr_imm = re.search(r".*", args)
+
+        # Example call a2f
+        # Example call *0
+        # Example jmp  64
+        elif mnemonic in X86_BRANCH_INSTRUCTIONS or "call" in mnemonic:
+            addr_imm = re.search(r"(^|(?<=\*)|(?<=\*\%cs\:))[0-9a-f]+(?!x)", args)
+
+        # Direct use of reloc
+        # Match 0x0 part to replace
+
+        # Example %edi,0
+        # Example movw $0x0,0x0
+        if not addr_imm:
+            addr_imm = re.search(r"(?:0x)?(?<![1-9])0$", args)
+
+        # Example movw $0x0,0x0(%si)
+        if not addr_imm and not last_op:
+            addr_imm = re.search(r"(?<=,)(?:0x)?0+(?=\(.*\))", args)
+
+        # Example 0x0,0x8(%edi)
+        # Example 0x0,%edi
+        # Example *0x0(,%edx,4)
+        # Example $0x0,0x4(%edi)
+        if not addr_imm:
+            addr_imm = re.search(r"(^\$?|(?<=\*))(?:0x)?0(?!x)", args)
+
+        # Offset value
+
+        # Example movw $0x0,0x4
+        # Example %edi,4
+        if not addr_imm:
+            addr_imm = re.search(r"(?:-)?(?:0x)?[0-9a-f]+$", args)
+            offset = True
+
+        # Example movw $0x0,0x4(%si)
+        if not addr_imm and not last_op:
+            addr_imm = re.search(r"(?<=,)(?:-)?(?:0x)?[0-9a-f]+", args)
+            offset = True
+
+        # Example 0x4,%eax
+        # Example $0x4,%eax
+        if not addr_imm:
+            addr_imm = re.search(r"(^|(?<=\*)|(?:\$))(?:-)?(?:0x)?[0-9a-f]+", args)
+            offset = True
+
+        if not addr_imm:
+            addr_imm = re.search(
+                r"(^|(?<=\*)|(?<=\%[fgdecs]s\:))(?:-)?(?:0x)?[0-9a-f]+", args
+            )
+            offset = True
+
+        if not addr_imm:
+            assert False, f"failed to find address immediate for line '{prev}'"
+
+        start, end = addr_imm.span()
 
         if offset:
             of = addr_imm.group()
@@ -2494,7 +2497,7 @@ class AsmProcessorSH2(AsmProcessor):
             return mov_kind == 9 and mov_reg == tgt_reg
         return False
 
-    def process_reloc(self, row: str, prev: str) -> Tuple[str, Optional[str]]:
+    def process_reloc(self, row: str, prev: str, next_line_num: int) -> Tuple[str, Optional[str]]:
         repl = row.split()[-1]
         before, imm, after = parse_relocated_line(prev)
 
@@ -2591,7 +2594,7 @@ class AsmProcessorM68k(AsmProcessor):
             args,
         )
 
-    def process_reloc(self, row: str, prev: str) -> Tuple[str, Optional[str]]:
+    def process_reloc(self, row: str, prev: str, next_line_num: int) -> Tuple[str, Optional[str]]:
         repl = row.split()[-1]
         mnemonic, args = prev.split(maxsplit=1)
 
@@ -3210,6 +3213,17 @@ def process(dump: str, config: Config) -> List[Line]:
     data_refs: Dict[int, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
     output: List[Line] = []
     lines = dump.split("\n")
+
+    def next_line_num(i):
+        while i < len(lines):
+            if re.search(arch.re_reloc, lines[i]) or not re.match(r"^\s+[0-9a-f]+:\s+", lines[i]):
+                i += 1
+            else:
+                line_num_str = lines[i].split(":")[0]
+                line_num = int(line_num_str, 16) if line_num_str else None
+                return line_num
+        return 0
+
     while i < len(lines):
         row = lines[i]
         i += 1
@@ -3350,7 +3364,7 @@ def process(dump: str, config: Config) -> List[Line]:
                 reloc_row = lines[i]
                 if re.search(arch.re_reloc, reloc_row):
                     original, reloc_symbol = processor.process_reloc(
-                        reloc_row, original
+                        reloc_row, original, next_line_num(i+1)
                     )
                     if reloc_symbol is not None:
                         symbol = reloc_symbol
